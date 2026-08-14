@@ -1,14 +1,13 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <ArduinoJson.h> // Download this library https://github.com/bblanchon/ArduinoJson
-#include <TFT_eSPI.h> // Download this library https://github.com/Bodmer/TFT_espi
-#include <Sgp4.h> // Download this library https://github.com/sparkfun/SparkFun_SGP4_Arduino_Library
+#include <ArduinoJson.h>
+#include <TFT_eSPI.h>
+#include <Sgp4.h>
 #include <time.h>
 #include <math.h>
 
-#include "map.h"  // include these two files in the same folder with arduino code
+#include "map.h"
 #include "tangoFont.h"
-
 #define CUSTOM_FONT tangoFont
 
 const char* WIFI_SSID = "xxxxx";                        // Enter your wifi name
@@ -17,7 +16,7 @@ const char* N2YO_API_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxx"; // Enter the N2YO API ke
 
 const char* TLE_URL =
   "https://api.n2yo.com/rest/v1/satellite/tle/25544?apiKey=";
-  
+
 #define TIMEZONE_OFFSET_HOURS    6 // Enter your timezone hour
 #define TIMEZONE_OFFSET_MINUTES  0 // Enter your timezone minute
 
@@ -42,9 +41,9 @@ inline uint16_t panelBorder() { return tft.color565(85, 105, 135); }
 #define MAP_H 160
 #define MAP_X 0
 #define MAP_Y (SCREEN_H - MAP_H)  
-#define MARKER_RADIUS 3 
+#define MARKER_RADIUS 3   // px radius of the red ISS head
 
-const unsigned long TLE_INTERVAL   = 3600000UL; // 1 hour (remember rate limit is 1000/hour)
+const unsigned long TLE_INTERVAL   = 3600000UL; // 1 hour (remember max rate limit is 1000/hour)
 const unsigned long TLE_RETRY      = 300000UL;  // 5 min (after a failed fetch)
 const unsigned long POS_INTERVAL   = 1000UL;    // 1 second
 
@@ -61,19 +60,42 @@ char tleLine2[130];
 bool tleValid  = false;
 bool timeValid = false;
 
+TaskHandle_t tleTaskHandle = nullptr;
+SemaphoreHandle_t tleDataMutex;
+
+volatile bool tleFetchRequested = false; 
+volatile bool tleFetchBusy      = false; 
+volatile bool tleFetchDone      = false; 
+volatile bool tleFetchOk        = false; 
+
+bool fetchTLEFromNetwork(); 
+
+void tleTask(void* param)
+{
+  for (;;)
+  {
+    if (tleFetchRequested)
+    {
+      tleFetchRequested = false;
+      tleFetchBusy = true;
+      bool ok = fetchTLEFromNetwork();
+      tleFetchOk = ok;
+      tleFetchBusy = false;
+      tleFetchDone = true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
+}
+
 double issLat = 0.0;
 double issLon = 0.0;
 double issAlt = 0.0;
 
 int previousX = -1;
 int previousY = -1;
-
 bool havePreviousMarker = false;
-
-
 double previousTrailLat = 0.0;
 double previousTrailLon = 0.0;
-
 bool havePreviousTrail = false;
 
 #define TRAIL_COLOR TFT_YELLOW
@@ -143,11 +165,14 @@ void setup()
   Serial.println("==============================");
   Serial.println("       ESP32 ISS TRACKER");
   Serial.println("==============================");
+  tleDataMutex = xSemaphoreCreateMutex();
   tft.init();
   tft.setRotation(1);
   tft.setSwapBytes(true);
+
   pinMode(BRIGHTNESS_PIN, OUTPUT);
   digitalWrite(BRIGHTNESS_PIN, HIGH);
+
   tft.fillScreen(TFT_BLACK);
   tft.loadFont(CUSTOM_FONT);
   drawMap();
@@ -159,11 +184,10 @@ void setup()
   lonSprX   = 152;
   altLabelX = 227;
   altSprX   = 262;
-
   tft.loadFont(CUSTOM_FONT);
   drawStaticUI();
   tft.unloadFont();
-
+ 
   infoRowY = INFO_Y + (INFO_H - valH) / 2;
 
   latSpr.setColorDepth(16);
@@ -186,14 +210,17 @@ void setup()
   lonSpr.setTextColor(TFT_GREEN, panelBg());
   altSpr.setTextColor(TFT_GREEN, panelBg());
   timeSpr.setTextColor(TFT_WHITE, panelBg());
-
+  
   timeSprX = SCREEN_W - timeSpr.width() - 10;
   timeSprY = (HEADER_H - valH) / 2;
+  Serial.printf(
+    "[MEM] Free heap after TangoSans sprites: %u bytes\n",
+    ESP.getFreeHeap()
+  );
 
   Serial.println("[WIFI] Connecting...");
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED)
   {
@@ -216,24 +243,44 @@ void setup()
   Serial.println("[NTP] Starting...");
   tryNTP();
   lastNtpAttempt = millis();
-
   if (!timeValid)
     Serial.println("[NTP] Not synchronized yet - continuing");
   if (WiFi.status() == WL_CONNECTED)
   {
     Serial.println("[TLE] Downloading...");
     lastTLEAttempt = millis();
-    if (downloadTLE())
+    if (fetchTLEFromNetwork())
     {
-      tleValid = true;
-      lastTLEUpdate = millis();
-      Serial.println("[TLE] SUCCESS");
+      char name[] = "ISS";
+      xSemaphoreTake(tleDataMutex, portMAX_DELAY);
+      bool applied = iss.init(name, tleLine1, tleLine2);
+      xSemaphoreGive(tleDataMutex);
+      if (applied)
+      {
+        tleValid = true;
+        lastTLEUpdate = millis();
+        Serial.println("[TLE] SUCCESS");
+      }
+      else
+      {
+        Serial.println("[TLE] init() rejected fetched TLE");
+      }
     }
     else
     {
       Serial.println("[TLE] FAILED - will retry in 5 min");
     }
   }
+
+  xTaskCreatePinnedToCore(
+    tleTask,
+    "TLE Task",
+    8192,
+    NULL,
+    1,
+    &tleTaskHandle,
+    0
+  );
   drawHeader();
   drawInfo();
   Serial.println("[SYSTEM] Ready");
@@ -284,23 +331,42 @@ void loop()
     lastNtpAttempt = now;
     tryNTP();
   }
+
   bool tleDue = tleValid
     ? (now - lastTLEUpdate  >= TLE_INTERVAL)   // normal hourly refresh
     : (now - lastTLEAttempt >= TLE_RETRY);      // shorter backoff after a failure
-
-  if (tleDue)
+  if (tleDue && !tleFetchBusy && !tleFetchRequested)
   {
     lastTLEAttempt = now;
-    if (downloadTLE())
+    tleFetchRequested = true;  
+  }
+  if (tleFetchDone)
+  {
+    tleFetchDone = false;
+    if (tleFetchOk)
     {
-      tleValid = true;
-      lastTLEUpdate = now;
+      xSemaphoreTake(tleDataMutex, portMAX_DELAY);
+      char name[] = "ISS";
+      bool applied = iss.init(name, tleLine1, tleLine2);
+      xSemaphoreGive(tleDataMutex);
+      if (applied)
+      {
+        tleValid = true;
+        lastTLEUpdate = now;
+        Serial.println("[TLE] SUCCESS");
+      }
+      else
+      {
+        Serial.println("[TLE] init() rejected fetched TLE");
+      }
     }
     else
     {
       Serial.println("[TLE] Update failed - will retry in 5 min");
     }
   }
+
+
   if (tleValid &&
       timeValid &&
       now - lastPosition >= POS_INTERVAL)
@@ -325,6 +391,7 @@ void drawMap()
     worldMap
   );
 }
+
 void drawPanel()
 {
   tft.fillRect(
@@ -345,12 +412,14 @@ void drawPanel()
   );
 }
 
-bool downloadTLE()
+bool fetchTLEFromNetwork()
 {
   if (WiFi.status() != WL_CONNECTED)
     return false;
   String url = String(TLE_URL) + N2YO_API_KEY;
   HTTPClient http;
+  http.setConnectTimeout(5000);
+  http.setTimeout(5000);
   http.begin(url);
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK)
@@ -379,21 +448,22 @@ bool downloadTLE()
   int splitLen = 2;
   if (splitAt < 0)
   {
+    // Some responses use a bare \n between lines instead of \r\n
     splitAt = tleText.indexOf('\n');
     splitLen = 1;
   }
+
   if (splitAt < 0)
     return false;
   String line1 = tleText.substring(0, splitAt);
   String line2 = tleText.substring(splitAt + splitLen);
-
   line1.trim();
   line2.trim();
-
   if (!line1.startsWith("1 "))
     return false;
   if (!line2.startsWith("2 "))
     return false;
+  xSemaphoreTake(tleDataMutex, portMAX_DELAY);
   line1.toCharArray(
     tleLine1,
     sizeof(tleLine1)
@@ -402,24 +472,20 @@ bool downloadTLE()
     tleLine2,
     sizeof(tleLine2)
   );
-  char name[] = "ISS";
-  if (!iss.init(
-        name,
-        tleLine1,
-        tleLine2
-      ))
-  {
-    return false;
-  }
+  xSemaphoreGive(tleDataMutex);
   return true;
 }
+
 void calculateISS()
 {
   time_t now;
+
   time(&now);
+
   double jd =
     ((double)now / 86400.0)
     + 2440587.5;
+
   iss.findsat(jd);
   issLat = iss.satLat;
   issLon = iss.satLon;
@@ -442,6 +508,7 @@ int longitudeToX(double longitude)
       * MAP_W
       / 360.0
     );
+
   return constrain(
     x,
     0,
@@ -457,6 +524,7 @@ int latitudeToY(double latitude)
       * MAP_H
       / 180.0
     );
+
   return constrain(
     y,
     0,
@@ -468,12 +536,9 @@ void drawTrailLine(int x0, int y0, int x1, int y1)
 {
   int dx = abs(x1 - x0);
   int sx = (x0 < x1) ? 1 : -1;
-
   int dy = -abs(y1 - y0);
   int sy = (y0 < y1) ? 1 : -1;
-
   int err = dx + dy;
-
   while (true)
   {
     trailPlot(x0, y0);
@@ -482,13 +547,11 @@ void drawTrailLine(int x0, int y0, int x1, int y1)
       break;
 
     int e2 = 2 * err;
-
     if (e2 >= dy)
     {
       err += dy;
       x0 += sx;
     }
-
     if (e2 <= dx)
     {
       err += dx;
@@ -516,7 +579,6 @@ void addTrailPoint()
     trailPlot(x, y);
     return;
   }
-
   int oldX = longitudeToX(previousTrailLon);
   int oldY = latitudeToY(previousTrailLat);
   if (fabs(issLon - previousTrailLon) < 180.0)
@@ -528,6 +590,7 @@ void addTrailPoint()
     clearTrail();
     trailPlot(x, y);
   }
+
   previousTrailLat = issLat;
   previousTrailLon = issLon;
 }
@@ -537,7 +600,6 @@ void updateISSMarker()
   int x = longitudeToX(issLon);
   int y = latitudeToY(issLat);
 
-  
   if (havePreviousMarker)
   {
     for (int dy = -MARKER_RADIUS; dy <= MARKER_RADIUS; dy++)
@@ -546,13 +608,17 @@ void updateISSMarker()
 
       if (py < 0 || py >= MAP_H)
         continue;
+
       for (int dx = -MARKER_RADIUS; dx <= MARKER_RADIUS; dx++)
       {
         int px = previousX + dx;
+
         if (px < 0 || px >= MAP_W)
           continue;
+
         if (trailBitGet(px, py))
         {
+     
           tft.drawPixel(
             MAP_X + px,
             MAP_Y + py,
@@ -586,21 +652,26 @@ void updateISSMarker()
     MARKER_RADIUS,
     TFT_RED
   );
+
   previousX = x;
   previousY = y;
+
   havePreviousMarker = true;
 }
 
 void checkNewDay()
 {
   struct tm timeinfo;
+
   if (!getLocalTime(&timeinfo, 10))
     return;
+
   if (lastDay == -1)
   {
     lastDay = timeinfo.tm_mday;
     return;
   }
+
   if (timeinfo.tm_mday != lastDay)
   {
     Serial.println("[TRAIL] New UTC day");
@@ -614,22 +685,30 @@ void checkNewDay()
 
 void drawStaticUI()
 {
+ 
   valH       = tft.fontHeight() + 4;
   latLonValW = tft.textWidth("-180.00") + 4;
   altValW    = tft.textWidth("99999 km") + 4;
   timeValW   = tft.textWidth("88:88:88") + 4;
+
   tft.loadFont(CUSTOM_FONT);
   tft.setTextColor(TFT_YELLOW, panelBg());
+
   int titleH = tft.fontHeight();
   tft.setCursor(6, (HEADER_H - titleH) / 2);
   tft.print("Real-Time ISS Tracker");
+
   tft.setTextColor(TFT_WHITE, panelBg());
+
   int labelH = tft.fontHeight();
   int labelY = INFO_Y + (INFO_H - labelH) / 2;
+
   tft.setCursor(latLabelX, labelY);
   tft.print("LAT :");
+
   tft.setCursor(lonLabelX, labelY);
   tft.print("LON :");
+
   tft.setCursor(altLabelX, labelY);
   tft.print("ALT :");
 }
@@ -654,13 +733,17 @@ void drawHeader()
     localTime.tm_min,
     localTime.tm_sec
   );
+
   timeSpr.fillSprite(panelBg());
   timeSpr.drawString(clockText, 2, 2);
   timeSpr.pushSprite(timeSprX, timeSprY);
 }
+
+
 void drawInfo()
 {
   char buf[16];
+
   dtostrf(issLat, 0, 2, buf);
   latSpr.fillSprite(panelBg());
   latSpr.drawString(buf, 2, 2);
