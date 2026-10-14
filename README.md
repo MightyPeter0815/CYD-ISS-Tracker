@@ -1,14 +1,20 @@
 # CYD-ISS-Tracker
 
-A simple open-source **ISS tracker** for the Cheap Yellow Display (CYD).
 
-It uses the **N2YO API** to get the ISS's live position and displays it on an equirectangular world map.
 
-### What you need
-- ESP32 Cheap Yellow Display (CYD)
-- Wi-Fi
-- N2YO API key
+Fork from https://github.com/LazydaysCr/CYD-ISS-Tracker
 
-Upload the code, add your Wi-Fi details and N2YO API key, and you're done.
 
-Have fun tracking the ISS! 🛰️🌍
+
+
+
+Changes made by me:
+
+1. Added orbital speed calculations (because the library "SGP4" also includes the feature of vector speeds).
+2. Re-arange header values to include orbital speed value on the screen.
+3. Adding Home-Dot (changed a little bit the appearance of the dot) and forecast line ideas by "HS8MIO".
+4. Adjusting all y-positions by adding "6" (pixels) to the value, to correct a misalignment in comparison with n2yo (see also pictures before / after).
+5. Changing position refresh time to 5 sec. instead of 1 sec. (In my opinion there was to much movement on the screen with 1 sec.).
+6. Move the wifi access data and the API key into a "secret.h" file.
+7. Added the backside RGB-LED output, to switch the red backside LED off, otherwise it would be always on.
+

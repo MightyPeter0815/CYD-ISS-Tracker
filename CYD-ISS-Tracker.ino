@@ -10,14 +10,13 @@
 #include "tangoFont.h"
 #define CUSTOM_FONT tangoFont
 
-const char* WIFI_SSID = "xxxxx";                        // Enter your wifi name
-const char* WIFI_PASS = "xxxxxxxx";                     // Enter your wifi password
-const char* N2YO_API_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxx"; // Enter the N2YO API key
+//WIFI - Access Data und API-Key:
+#include "secrets.h"
 
 const char* TLE_URL =
   "https://api.n2yo.com/rest/v1/satellite/tle/25544?apiKey=";
 
-#define TIMEZONE_OFFSET_HOURS    6 // Enter your timezone hour
+#define TIMEZONE_OFFSET_HOURS    2 // Enter your timezone hour
 #define TIMEZONE_OFFSET_MINUTES  0 // Enter your timezone minute
 
 TFT_eSPI tft = TFT_eSPI();
@@ -40,17 +39,29 @@ inline uint16_t panelBorder() { return tft.color565(85, 105, 135); }
 #define MAP_W 320
 #define MAP_H 160
 #define MAP_X 0
-#define MAP_Y (SCREEN_H - MAP_H)  
-#define MARKER_RADIUS 3   // px radius of the red ISS head
+#define MAP_Y (SCREEN_H - MAP_H) 
+#define MARKER_RADIUS 4   // px radius of the red ISS head
+
+#define LED_RED_PIN 4
+
+// HS8MIO:
+// HOME marker: set your own location coordinates.
+// Change HOME_LAT and HOME_LON to your desired location.
+#define HOME_LAT  51.0        // y-Koordinate     //Dresden
+#define HOME_LON  13.0        // x-Koordinate
 
 const unsigned long TLE_INTERVAL   = 3600000UL; // 1 hour (remember max rate limit is 1000/hour)
 const unsigned long TLE_RETRY      = 300000UL;  // 5 min (after a failed fetch)
-const unsigned long POS_INTERVAL   = 1000UL;    // 1 second
+const unsigned long POS_INTERVAL   = 5000UL;    // 1 second --> 5 sec.
+//HS8MIO:
+const unsigned long FORECAST_INTERVAL = 30000UL; // redraw forecast every 30 seconds
 
 unsigned long lastTLEUpdate = 0;
 unsigned long lastTLEAttempt = 0;
 unsigned long lastPosition  = 0;
 unsigned long lastNtpAttempt = 0;
+//HS8MIO:
+unsigned long lastForecastDraw = 0;
 
 Sgp4 iss;
 
@@ -87,9 +98,16 @@ void tleTask(void* param)
   }
 }
 
+//Parameter Position und Höhe
 double issLat = 0.0;
 double issLon = 0.0;
 double issAlt = 0.0;
+//Parameter Orbitalgeschwindigkeit
+double vx = 0.0;      //Vektoren x, y, z
+double vy = 0.0;
+double vz = 0.0;
+double orbitalVelocityKms = 0.0;    //Geschw. in km/s
+double orbitalVelocityKmh = 0.0;    //Geschw. in km/h
 
 int previousX = -1;
 int previousY = -1;
@@ -148,6 +166,7 @@ int lastDay = -1;
 TFT_eSprite latSpr  = TFT_eSprite(&tft);
 TFT_eSprite lonSpr  = TFT_eSprite(&tft);
 TFT_eSprite altSpr  = TFT_eSprite(&tft);
+TFT_eSprite spdSpr  = TFT_eSprite(&tft);
 TFT_eSprite timeSpr = TFT_eSprite(&tft);
 
 int latLabelX, lonLabelX, altLabelX;
@@ -155,12 +174,25 @@ int latSprX, lonSprX, altSprX;
 int infoRowY;
 int timeSprX, timeSprY;
 int valH;
-int latLonValW, altValW, timeValW;
+int latLonValW, altValW, timeValW, spdValW;
+
+//HS8MIO:
+void drawHomeMarker();
+void redrawTrailBitmap();
+void drawPredictedPathToMapEdge();
+void drawDashedForecastSegment(int x0, int y0, int x1, int y1, int &phase);
+int longitudeToX(double longitude);
+int latitudeToY(double latitude);
+
 
 void setup()
 {
   Serial.begin(115200);
   delay(500);
+  
+  pinMode(LED_RED_PIN, OUTPUT);
+  digitalWrite(LED_RED_PIN, HIGH);   // Rote LED auf Rückseite ausschalten
+  
   Serial.println();
   Serial.println("==============================");
   Serial.println("       ESP32 ISS TRACKER");
@@ -179,11 +211,11 @@ void setup()
   trailBitmapClear();
   drawPanel();
   latLabelX = 6;
-  latSprX   = 42;
-  lonLabelX = 117;
-  lonSprX   = 152;
-  altLabelX = 227;
-  altSprX   = 262;
+  latSprX   = 45;
+  lonLabelX = 6;
+  lonSprX   = 45;
+  altLabelX = 175;
+  altSprX   = 211;
   tft.loadFont(CUSTOM_FONT);
   drawStaticUI();
   tft.unloadFont();
@@ -202,6 +234,11 @@ void setup()
   altSpr.loadFont(CUSTOM_FONT);
   altSpr.createSprite(altValW, valH);
 
+  spdSpr.setColorDepth(16);
+  spdSpr.loadFont(CUSTOM_FONT);
+  spdSpr.createSprite(spdValW, valH);
+
+
   timeSpr.setColorDepth(16);
   timeSpr.loadFont(CUSTOM_FONT);
   timeSpr.createSprite(timeValW, valH);
@@ -209,10 +246,11 @@ void setup()
   latSpr.setTextColor(TFT_GREEN, panelBg());
   lonSpr.setTextColor(TFT_GREEN, panelBg());
   altSpr.setTextColor(TFT_GREEN, panelBg());
+  spdSpr.setTextColor(TFT_GREEN, panelBg());
   timeSpr.setTextColor(TFT_WHITE, panelBg());
   
   timeSprX = SCREEN_W - timeSpr.width() - 10;
-  timeSprY = (HEADER_H - valH) / 2;
+  timeSprY = ((HEADER_H - valH) / 2) + 2;
   Serial.printf(
     "[MEM] Free heap after TangoSans sprites: %u bytes\n",
     ESP.getFreeHeap()
@@ -375,6 +413,18 @@ void loop()
     calculateISS();
     checkNewDay();
     addTrailPoint();
+
+    //HS8MIO: Rebuild map layers periodically so the previous forecast can be erased cleanly.
+    if (lastForecastDraw == 0 || now - lastForecastDraw >= FORECAST_INTERVAL)
+    {
+      drawMap();
+      redrawTrailBitmap();
+      drawPredictedPathToMapEdge();
+      drawHomeMarker();
+      lastForecastDraw = now;
+      havePreviousMarker = false;
+    }
+
     updateISSMarker();
     drawHeader();
     drawInfo();
@@ -483,13 +533,21 @@ void calculateISS()
   time(&now);
 
   double jd =
-    ((double)now / 86400.0)
-    + 2440587.5;
+    ((double)now / 86400.0)         //86400 is the number of seconds in a day;
+    + 2440587.5;                    //2440587.5 is the day/time in the julian calender 1/1/1970 0:00 UTC
 
   iss.findsat(jd);
   issLat = iss.satLat;
   issLon = iss.satLon;
   issAlt = iss.satAlt;
+
+  //Geschw.-berechnung:
+  vx = iss.vo[0];
+  vy = iss.vo[1];
+  vz = iss.vo[2];
+  orbitalVelocityKms = sqrt(vx*vx + vy*vy + vz*vz);
+  orbitalVelocityKmh = orbitalVelocityKms * 3600.0;
+
 
   Serial.print("[ISS] ");
   Serial.print(issLat, 3);
@@ -498,6 +556,18 @@ void calculateISS()
   Serial.print(" / ");
   Serial.print(issAlt, 1);
   Serial.println(" km");
+
+  Serial.print("Vektorgeschw. (x, y, z): ");
+  Serial.print(vx);        //Vektorgeschwindigkeiten 0, 1, 2 / x, y, z
+  Serial.print(" / ");
+  Serial.print(vy);
+  Serial.print(" / ");
+  Serial.println(vz);
+  Serial.print("Orbitalgeschw.: ");
+  Serial.print(orbitalVelocityKms, 2);
+  Serial.print(" km/s (");
+  Serial.print(orbitalVelocityKmh, 0);
+  Serial.println(" km/h)");
 }
 
 int longitudeToX(double longitude)
@@ -519,10 +589,11 @@ int longitudeToX(double longitude)
 int latitudeToY(double latitude)
 {
   int y =
-    (int)(
+    (int)((
       (90.0 - latitude)
       * MAP_H
-      / 180.0
+      / 180.0)
+      + 6
     );
 
   return constrain(
@@ -689,13 +760,14 @@ void drawStaticUI()
   valH       = tft.fontHeight() + 4;
   latLonValW = tft.textWidth("-180.00") + 4;
   altValW    = tft.textWidth("99999 km") + 4;
+  spdValW    = tft.textWidth("999999 km/h") + 4;
   timeValW   = tft.textWidth("88:88:88") + 4;
 
   tft.loadFont(CUSTOM_FONT);
   tft.setTextColor(TFT_YELLOW, panelBg());
 
   int titleH = tft.fontHeight();
-  tft.setCursor(6, (HEADER_H - titleH) / 2);
+  tft.setCursor(6, ((HEADER_H - titleH) / 2) + 2);
   tft.print("Real-Time ISS Tracker");
 
   tft.setTextColor(TFT_WHITE, panelBg());
@@ -703,14 +775,18 @@ void drawStaticUI()
   int labelH = tft.fontHeight();
   int labelY = INFO_Y + (INFO_H - labelH) / 2;
 
-  tft.setCursor(latLabelX, labelY);
+  tft.setCursor(latLabelX, labelY - 6);
   tft.print("LAT :");
 
-  tft.setCursor(lonLabelX, labelY);
+  tft.setCursor(lonLabelX, labelY + 10);
   tft.print("LON :");
 
-  tft.setCursor(altLabelX, labelY);
+  tft.setCursor(altLabelX, labelY - 6);
   tft.print("ALT :");
+
+  tft.setCursor(altLabelX, labelY + 10);
+  tft.print("SPD :");
+
 }
 
 void drawHeader()
@@ -747,15 +823,144 @@ void drawInfo()
   dtostrf(issLat, 0, 2, buf);
   latSpr.fillSprite(panelBg());
   latSpr.drawString(buf, 2, 2);
-  latSpr.pushSprite(latSprX, infoRowY);
+  latSpr.pushSprite(latSprX, infoRowY - 6);
 
   dtostrf(issLon, 0, 2, buf);
   lonSpr.fillSprite(panelBg());
   lonSpr.drawString(buf, 2, 2);
-  lonSpr.pushSprite(lonSprX, infoRowY);
+  lonSpr.pushSprite(lonSprX, infoRowY + 10);
 
   sprintf(buf, "%.0f km", issAlt);
   altSpr.fillSprite(panelBg());
   altSpr.drawString(buf, 2, 2);
-  altSpr.pushSprite(altSprX, infoRowY);
+  altSpr.pushSprite(altSprX, infoRowY - 6);
+
+  sprintf(buf, "%.0f km/h", orbitalVelocityKmh);
+  spdSpr.fillSprite(panelBg());
+  spdSpr.drawString(buf, 2, 2);
+  spdSpr.pushSprite(altSprX, infoRowY + 10);
+
+}
+
+
+// HS8MIO:
+// Draw a fixed HOME marker over the map/trail layer.
+// Called after map initialization and after each ISS marker update.
+void drawHomeMarker()
+{
+  const int x = longitudeToX(HOME_LON);
+  const int y = latitudeToY(HOME_LAT);
+
+  // HOME-Dot:
+  tft.fillCircle(MAP_X + x, MAP_Y + y, 3, TFT_WHITE);
+
+}
+
+// Replay the persistent yellow trail bitmap after the map is redrawn.
+void redrawTrailBitmap()
+{
+  for (int y = 0; y < MAP_H; y++)
+  {
+    for (int x = 0; x < MAP_W; x++)
+    {
+      if (trailBitGet(x, y))
+        tft.drawPixel(MAP_X + x, MAP_Y + y, TRAIL_COLOR);
+    }
+  }
+}
+
+// Draw a thin dashed red prediction from the current ISS position
+// until its ground track reaches the map's longitude seam (left/right edge).
+void drawPredictedPathToMapEdge()
+{
+  const double stepSeconds = 20.0;
+  const int maxSteps = 360; // up to 120 minutes, normally stops at the map edge first
+  time_t nowEpoch;
+  time(&nowEpoch);
+  const double jdNow = ((double)nowEpoch / 86400.0) + 2440587.5;
+
+  double prevLat = issLat;
+  double prevLon = issLon;
+  int prevX = longitudeToX(prevLon);
+  int prevY = latitudeToY(prevLat);
+  int dashPhase = 0;
+  bool reachedEdge = false;
+
+  for (int i = 1; i <= maxSteps; i++)
+  {
+    double jdFuture = jdNow + ((stepSeconds * i) / 86400.0);
+    iss.findsat(jdFuture);
+    double nextLat = iss.satLat;
+    double nextLon = iss.satLon;
+
+    // Detect crossing of the +/-180-degree map seam.
+    if (fabs(nextLon - prevLon) > 180.0)
+    {
+      double adjustedNextLon = nextLon;
+      double edgeLon;
+      int edgeX;
+      if (nextLon < prevLon)
+      {
+        adjustedNextLon += 360.0;
+        edgeLon = 180.0;
+        edgeX = MAP_W - 1;
+      }
+      else
+      {
+        adjustedNextLon -= 360.0;
+        edgeLon = -180.0;
+        edgeX = 0;
+      }
+
+      double denom = adjustedNextLon - prevLon;
+      double fraction = (fabs(denom) < 1e-9) ? 0.0 : (edgeLon - prevLon) / denom;
+      double edgeLat = prevLat + (nextLat - prevLat) * fraction;
+      int edgeY = latitudeToY(edgeLat);
+      drawDashedForecastSegment(prevX, prevY, edgeX, edgeY, dashPhase);
+      reachedEdge = true;
+      break;
+    }
+
+    int nextX = longitudeToX(nextLon);
+    int nextY = latitudeToY(nextLat);
+    drawDashedForecastSegment(prevX, prevY, nextX, nextY, dashPhase);
+
+    prevLat = nextLat;
+    prevLon = nextLon;
+    prevX = nextX;
+    prevY = nextY;
+  }
+
+  if (!reachedEdge)
+    Serial.println("[PREDICT] Map edge not reached within 120 minutes");
+
+  // Restore the library's SGP4 state to the real current timestamp.
+  iss.findsat(jdNow);
+  issLat = iss.satLat;
+  issLon = iss.satLon;
+  issAlt = iss.satAlt;
+}
+
+// Bresenham line with a repeating 3-pixel dash / 3-pixel gap pattern.
+void drawDashedForecastSegment(int x0, int y0, int x1, int y1, int &phase)
+{
+  int dx = abs(x1 - x0);
+  int sx = (x0 < x1) ? 1 : -1;
+  int dy = -abs(y1 - y0);
+  int sy = (y0 < y1) ? 1 : -1;
+  int err = dx + dy;
+
+  while (true)
+  {
+    if ((phase % 6) < 3 && x0 >= 0 && x0 < MAP_W && y0 >= 0 && y0 < MAP_H)
+      tft.drawPixel(MAP_X + x0, MAP_Y + y0, TFT_RED);
+    phase++;
+
+    if (x0 == x1 && y0 == y1)
+      break;
+
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
 }
