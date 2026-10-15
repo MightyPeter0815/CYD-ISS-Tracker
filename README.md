@@ -18,3 +18,4 @@ Changes made by me:
 6. Move the wifi access data and the API key into a "secret.h" file.
 7. Added the backside RGB-LED output, to switch the red backside LED off, otherwise it would be always on.
 
+![Screen of the Tracker after Changes](pictures/Screen.jpg)
